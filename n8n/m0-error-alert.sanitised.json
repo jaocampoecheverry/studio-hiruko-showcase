@@ -1,0 +1,229 @@
+{
+  "name": "M0 Error alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "<id>",
+      "name": "On any failed run",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Error Trigger payload: { execution: { id, url, error, lastNodeExecuted, mode }, workflow }\n// or, when the trigger itself failed: { trigger: { error, mode }, workflow }.\nconst p = $json;\nconst ex = p.execution || {};\nconst err = ex.error || (p.trigger && p.trigger.error) || {};\nconst msg = [err.message, err.description].filter(Boolean).join(' – ') || 'No error message';\nreturn [{ json: {\n  kind: 'crash',\n  workflow: (p.workflow || {}).name || '?',\n  workflow_id: (p.workflow || {}).id || null,\n  execution_id: ex.id || null,\n  step: (err.node && err.node.name) || ex.lastNodeExecuted || (p.trigger ? 'trigger' : '?'),\n  error: String(msg).slice(0, 1500),\n  mode: ex.mode || (p.trigger || {}).mode || null,\n} }];"
+      },
+      "id": "<id>",
+      "name": "Failed run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://localhost:5678/api/v1/executions/{{ $json.execution_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "includeData",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "<id>",
+      "name": "Fetch run data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<credential-id>",
+          "name": "<credential>"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find the studio in the failed run's data (best effort; the API key may be missing).\nconst base = $('Failed run').item.json;\nconst run = $json || {};\nlet name = null, slug = null, ref = null;\nconst fromRe = /^\\s*\"?([^\"<]+?)\"?\\s*<[^>]*@send\\.studiohiruko\\.com>/;\nlet budget = 20000;\nconst walk = (v, depth) => {\n  if (!v || typeof v !== 'object' || depth > 12 || --budget < 0) return;\n  for (const [k, x] of Object.entries(v)) {\n    if (typeof x === 'string') {\n      if (!name && (k === 'studio' || k === 'studio_name')) name = x;\n      else if (!slug && (k === 'slug' || k === 'client_slug' || k === 'p_client_slug')) slug = x;\n      else if (!name && k === 'from') { const m = x.match(fromRe); if (m && !/Studio Hiruko/.test(m[1])) name = m[1].trim(); }\n      else if (!ref && (k === 'lead_id' || k === 'p_lead_id')) ref = 'lead ' + x;\n    } else if (x && typeof x === 'object') {\n      if (!name && k === 'client' && typeof x.name === 'string') name = x.name;\n      walk(x, depth + 1);\n    }\n  }\n};\nconst runData = run.data && run.data.resultData && run.data.resultData.runData;\nif (runData) walk(runData, 0);\nconst studio = name && slug ? name + ' (' + slug + ')' : (name || slug ||\n  (runData ? 'not found in run data' : 'unknown (could not read the run)'));\nreturn [{ json: { ...base, studio, ref } }];"
+      },
+      "id": "<id>",
+      "name": "Find the studio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "<id>",
+      "name": "Handled failure (from a workflow)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Called by a workflow branch that handled a failure and carried on.\nreturn $input.all().map((item) => {\n  const a = item.json.alert || item.json;\n  return { json: {\n    kind: 'handled', workflow: a.workflow || '?', workflow_id: a.workflow_id || null,\n    execution_id: a.execution_id || null, step: a.step || '?', error: a.error || '?',\n    studio: a.studio || 'unknown', ref: a.ref || null,\n  } };\n});"
+      },
+      "id": "<id>",
+      "name": "Handled failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the alert email. Throttle: the same workflow + step + error at most once\n// an hour, and 20 alerts a day in all, so a failing schedule can't use up the\n// Resend quota the studios' emails depend on.\nconst TO = '<email>', FROM = 'Studio Hiruko alerts <<email>>';\nconst s = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst day = new Date().toISOString().slice(0, 10);\nif (s.day !== day) { s.day = day; s.count = 0; }\ns.seen = s.seen || {};\nfor (const [k, v] of Object.entries(s.seen)) if (now - v.at > 3600e3 && !v.held) delete s.seen[k];\n\nconst out = [];\nfor (const item of $input.all()) {\n  const a = item.json;\n  const cleanStudio = String(a.studio || 'unknown').replace(/\\s*<[^>]*>\\s*$/, '').replace(/^\"|\"$/g, '');\n  const key = [a.workflow, a.step, String(a.error).slice(0, 120)].join('|');\n  const prev = s.seen[key];\n  if (prev && now - prev.at < 3600e3) { prev.held = (prev.held || 0) + 1; continue; }\n  if (s.count >= 20) continue;\n  const held = prev && prev.held ? prev.held : 0;\n  s.seen[key] = { at: now, held: 0 };\n  s.count += 1;\n  const link = a.workflow_id && a.execution_id\n    ? 'https://<n8n-host>/workflow/' + a.workflow_id + '/executions/' + a.execution_id : 'n/a';\n  const when = new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' });\n  const text = [\n    a.kind === 'crash' ? 'An n8n run failed and stopped.' : 'An n8n run hit a failure and carried on (the studio may need to reply personally).',\n    '',\n    'Workflow:     ' + a.workflow,\n    'Studio:       ' + cleanStudio,\n    'Failing step: ' + a.step,\n    'Reference:    ' + (a.ref || 'n/a'),\n    'When:         ' + when + ' (London)',\n    '',\n    'Error:',\n    a.error,\n    '',\n    'Open the run: ' + link,\n    held ? '\\n' + held + ' more of the same in the last hour were not emailed.' : null,\n    '',\n    'Same workflow, step and error: at most one email an hour, and 20 a day in all.',\n  ].filter((l) => l !== null).join('\\n');\n  out.push({ json: { resend_request: {\n    from: FROM, to: [TO],\n    subject: 'Alert: ' + a.workflow + ' – ' + a.step + (cleanStudio && !/^unknown|^not found/.test(cleanStudio) ? ' – ' + cleanStudio : ''),\n    text,\n    tags: [{ name: 'kind', value: 'error_alert' }],\n  } } });\n}\nreturn out;"
+      },
+      "id": "<id>",
+      "name": "Alert email (throttled)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.resend.com/emails",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.resend_request) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "<id>",
+      "name": "Resend: send alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<credential-id>",
+          "name": "<credential>"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "On any failed run": {
+      "main": [
+        [
+          {
+            "node": "Failed run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Failed run": {
+      "main": [
+        [
+          {
+            "node": "Fetch run data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch run data": {
+      "main": [
+        [
+          {
+            "node": "Find the studio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find the studio": {
+      "main": [
+        [
+          {
+            "node": "Alert email (throttled)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handled failure (from a workflow)": {
+      "main": [
+        [
+          {
+            "node": "Handled failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handled failure": {
+      "main": [
+        [
+          {
+            "node": "Alert email (throttled)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert email (throttled)": {
+      "main": [
+        [
+          {
+            "node": "Resend: send alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
